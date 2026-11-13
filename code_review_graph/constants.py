@@ -5,9 +5,22 @@ from __future__ import annotations
 import logging
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 
 logger = logging.getLogger(__name__)
+
+READ_ONLY_ENV = "CRG_READ_ONLY"
+
+
+def read_only_requested() -> bool:
+    """Return whether this process must avoid writes to graph state."""
+    return os.environ.get(READ_ONLY_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 # ---------------------------------------------------------------------------
 # Numeric environment overrides (#912)
@@ -279,8 +292,6 @@ IMPACT_SCORE_FLOOR = _bounded_float_env(
 #: Follows the same convention as CRG_DATA_DIR.
 CRG_HOME_ENV = "CRG_HOME"
 
-_DEFAULT_CRG_HOME = Path.home() / ".code-review-graph"
-
 
 def crg_home() -> Path:
     """Return the per-user state directory for code-review-graph.
@@ -296,7 +307,7 @@ def crg_home() -> Path:
     override = os.environ.get(CRG_HOME_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return _DEFAULT_CRG_HOME
+    return Path.home() / ".code-review-graph"
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +325,22 @@ def crg_home() -> Path:
 #: the read path expands it; see ``expand_import_scope`` in graph.py.
 IMPORT_SCOPE_KEY = "import_scope"
 
+#: ``edges.extra`` key holding the qualified name an edge endpoint was written
+#: with, once that name turned out to match no node. The endpoint itself goes
+#: back to the plain name the source wrote. See
+#: ``GraphStore._settle_unbound_endpoints``.
+CLAIMED_ENDPOINT_KEY = "claimed_endpoint"
+
+#: ``edges.extra`` key on an edge moved to the ancestor that declares the method
+#: it calls. It holds the endpoint as the parser wrote it (``<file>::Leaf.run``),
+#: so every later pass can check the move again from scratch. See
+#: ``GraphStore._resolve_inherited_endpoints``.
+INHERITED_ENDPOINT_KEY = "inherited_endpoint"
+
+#: ``edges.extra`` key naming the class a call went through when the bare-name
+#: resolver bound it to a method that class inherits.
+INHERITED_THROUGH_KEY = "inherited_through"
+
 #: The target directory's own files are the imported unit; subdirectories are
 #: separate packages and are NOT members. This is Go's rule.
 IMPORT_SCOPE_PACKAGE = "package"
@@ -323,3 +350,99 @@ IMPORT_SCOPE_PACKAGE = "package"
 IMPORT_SCOPE_TREE = "tree"
 
 IMPORT_SCOPES = (IMPORT_SCOPE_PACKAGE, IMPORT_SCOPE_TREE)
+
+
+# ---------------------------------------------------------------------------
+# Path identity & memory reclamation helpers
+# ---------------------------------------------------------------------------
+
+def normalize_file_path(path: "str | os.PathLike[str]") -> str:
+    """Return *path* as a forward-slash (POSIX) string for graph identity.
+
+    ``file_path`` values and the path component of qualified names are graph
+    identity: they must be separator-stable across operating systems so a
+    graph built on Windows produces the same identifiers as one built on
+    Linux/macOS, and so consumers that reconstruct identifiers from ``Path``
+    objects always agree with the parser. See issue #774.
+
+    Only apply this to file *paths* — never to symbol names: PHP namespace
+    identifiers (``App\\Domain\\Job``) legitimately contain backslashes.
+    """
+    if isinstance(path, str):
+        return path.replace("\\", "/") if "\\" in path else path
+    if isinstance(path, PurePath):
+        return path.as_posix()
+    return str(path).replace("\\", "/")
+
+
+_MALLOC_TRIM_FN: object | None = None
+_MALLOC_TRIM_PROBED = False
+
+
+def release_os_memory() -> None:
+    """Run garbage collection and return free heap pages to the OS where supported.
+
+    Python's pymalloc and glibc's ptmalloc retain freed arenas in the process
+    address space after large graph builds, AST parses, or NetworkX/embedding
+    operations. Calling ``malloc_trim(0)`` on Linux returns unused heap pages
+    to the kernel, directly lowering resident memory (RSS).
+    """
+    global _MALLOC_TRIM_FN, _MALLOC_TRIM_PROBED
+    import gc
+    import sys
+
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        if not _MALLOC_TRIM_PROBED:
+            _MALLOC_TRIM_PROBED = True
+            try:
+                import ctypes
+
+                _MALLOC_TRIM_FN = ctypes.CDLL("libc.so.6").malloc_trim
+            except Exception:
+                _MALLOC_TRIM_FN = None
+        if callable(_MALLOC_TRIM_FN):
+            try:
+                _MALLOC_TRIM_FN(0)
+            except Exception as exc:
+                logger.debug("malloc_trim(0) failed: %s", exc)
+
+
+#: ``edges.extra`` key on an ``IMPORTS_FROM`` edge whose import does not run as
+#: the importing file loads. No key means it does. Graphs built before this key
+#: existed have none, so they read every import as a load-time one until rebuilt.
+IMPORT_CONTEXT_KEY = "import_context"
+
+#: Never runs: ``if TYPE_CHECKING:`` in Python, ``import type`` in TypeScript.
+IMPORT_CONTEXT_TYPE_ONLY = "type_only"
+
+#: Runs late: inside a function, a JavaScript dynamic ``import()``, a Ruby ``autoload``.
+IMPORT_CONTEXT_DEFERRED = "deferred"
+
+#: Python ``from . import sibling``: the edge to the package is only the route to
+#: the sibling, and a file's own package is already loaded before the file is.
+IMPORT_CONTEXT_PARENT_PACKAGE = "parent_package"
+
+#: Every ``query_graph`` pattern and what it finds. The MCP tool and the CLI
+#: ``query`` command both take these, so a new one reaches both.
+QUERY_PATTERNS = {
+    "callers_of": "Find all functions that call a given function",
+    "references_to": "Find all nodes that reference a given symbol",
+    "callees_of": "Find all functions called by a given function",
+    "imports_of": "Find all imports of a given file or module",
+    "importers_of": "Find all files that import a given file or module",
+    "children_of": "Find all nodes contained in a file or class",
+    "tests_for": "Find all tests for a given function or class",
+    "inheritors_of": "Find all classes that inherit from a given class",
+    "triggers_of": "Find methods invoked by a scheduler or other trigger",
+    "triggered_by": "Find schedulers or other triggers that invoke a method",
+    "publishers_of": "Find methods that publish an event",
+    "listeners_of": "Find methods that listen for an event",
+    "advises": "Find methods an AOP advice targets via its pointcut",
+    "advised_by": "Find AOP advice methods that intercept a given method",
+    "handlers_of": "Find methods that handle an endpoint",
+    "endpoints_for": "Find endpoints handled by a method",
+    "consumers_of": "Find classes that consume a Spring configuration property",
+    "file_summary": "Get a summary of all nodes in a file",
+    "path_to": "Find how a given symbol or file reaches another",
+}

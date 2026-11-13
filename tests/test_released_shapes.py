@@ -41,6 +41,19 @@ PLACEHOLDERS = {
     "_GEMINI_CLI_HOOK_FILENAMES[1]": "crg-update.sh",
     "sys.executable": "/opt/previous-release/bin/python3.9",
     "hook_command": _PASSTHROUGH,
+    # v2.4.0 moved these commands into a constant and a helper.
+    "_CLAUDE_UPDATE_HOOK_COMMAND": (
+        "command -v code-review-graph >/dev/null 2>&1"
+        " && code-review-graph hook-update; cat >/dev/null || true"
+    ),
+    "_codex_hook_command('hook-status')": (
+        "cat | { if command -v code-review-graph >/dev/null 2>&1; "
+        "then code-review-graph hook-status; else cat >/dev/null; fi; }"
+    ),
+    "_codex_hook_command('hook-update')": (
+        "cat | { if command -v code-review-graph >/dev/null 2>&1; "
+        "then code-review-graph hook-update; else cat >/dev/null; fi; }"
+    ),
 }
 
 # Frozen from the tags below, so a checkout without tags still checks
@@ -139,7 +152,7 @@ def _render(node: ast.expr) -> str | None:
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left, right = _render(node.left), _render(node.right)
         return None if left is None or right is None else left + right
-    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript, ast.Call)):
         return PLACEHOLDERS.get(ast.unparse(node))
     return None
 
@@ -334,7 +347,7 @@ def test_every_released_hook_body_is_still_recognised(body: str) -> None:
     upgraded = skills._upgrade_git_hook_block(hook)
     assert upgraded is not None
     assert body not in upgraded
-    assert skills._GIT_HOOK_BLOCK in upgraded
+    assert skills._git_hook_block() in upgraded
     assert "echo user-hook" in upgraded and "echo trailing" in upgraded
 
     stripped, removed = uninstall._strip_git_hook_blocks(hook)
@@ -391,3 +404,46 @@ def test_every_released_server_entry_is_recognised() -> None:
         "an MCP entry shape a release wrote is no longer recognised, so a stale "
         "interpreter path or dead checkout would survive a reinstall"
     )
+
+
+@pytest.mark.parametrize("platform", sorted(skills.PLATFORMS))
+def test_the_entry_each_platform_writes_today_is_recognised(
+    platform: str, tmp_path: Path
+) -> None:
+    """The next release has to replace what this one writes, so it must claim it.
+
+    Needs no tags: it covers a platform no release has shipped yet, such as
+    MiMo Code (#688), whose shape the tags cannot show.
+    """
+    spec = skills.PLATFORMS[platform]
+    entry = skills._build_server_entry(spec, key=platform, repo_root=tmp_path)
+    assert skills._is_generated_server_entry(entry), (
+        f"{platform} writes {entry!r}, which a later install or uninstall would not "
+        "recognise as its own"
+    )
+
+
+def test_every_released_serve_command_is_recognised_in_a_dsh_row() -> None:
+    """A DeepSeek Harness row holds only ``command`` and ``args`` (PR #1101).
+
+    So every command line a release has written must still mark the row as
+    ours, or a reinstall after an upgrade would keep the old one.
+    """
+    from code_review_graph import dsh
+
+    _require_tags()
+    commands = {
+        shape: tags
+        for shape, tags in _released_server_entries().items()
+        if set(dict(ast.literal_eval(shape))) == {"command", "args"}
+        and isinstance(dict(ast.literal_eval(shape))["command"], str)
+    }
+    assert commands, "no command-and-args entry could be read from any tag"
+    unrecognised = {
+        shape: sorted(tags)
+        for shape, tags in commands.items()
+        if not dsh.is_generated_row(
+            dsh.server_row(dict(ast.literal_eval(shape))), skills._is_generated_server_entry
+        )
+    }
+    assert unrecognised == {}

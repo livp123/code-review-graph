@@ -27,7 +27,9 @@ _MAX_GAPS_PER_CATEGORY = 50
 _MINIMAL_HUB_FIELDS = ("name", "kind", "total_degree")
 _MINIMAL_BRIDGE_FIELDS = ("name", "kind", "betweenness")
 _MINIMAL_SURPRISE_FIELDS = ("source", "target", "edge_kind", "surprise_score")
-_MINIMAL_GAP_FIELDS = ("name", "qualified_name", "community_id", "size", "degree")
+_MINIMAL_GAP_FIELDS = (
+    "name", "qualified_name", "community_id", "size", "degree", "load_time",
+)
 
 
 def _project(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -76,9 +78,9 @@ def get_hub_nodes_func(
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_impact_radius -- check blast radius of a hub",
-                "query_graph callers_of -- see what calls a hub",
-                "get_bridge_nodes -- find architectural chokepoints",
+                "get_impact_radius_tool -- check blast radius of a hub",
+                "query_graph_tool callers_of -- see what calls a hub",
+                "get_bridge_nodes_tool -- find architectural chokepoints",
             ],
         }
     finally:
@@ -126,9 +128,9 @@ def get_bridge_nodes_func(
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_hub_nodes -- find most connected nodes",
-                "get_impact_radius -- check blast radius",
-                "detect_changes -- see if bridges are affected",
+                "get_hub_nodes_tool -- find most connected nodes",
+                "get_impact_radius_tool -- check blast radius",
+                "detect_changes_tool -- see if bridges are affected",
             ],
         }
     finally:
@@ -144,7 +146,8 @@ def get_knowledge_gaps_func(
 
     Finds: isolated nodes (disconnected), thin communities
     (< 3 members), untested hotspots (high-degree, no tests),
-    and single-file communities.
+    single-file communities, and import cycles (files that
+    import each other).
 
     Args:
         repo_root: Repository root (auto-detected if omitted).
@@ -160,9 +163,9 @@ def get_knowledge_gaps_func(
     """
     _validate_positive_int(max_per_category, "max_per_category")
 
-    store, _root = _get_store(repo_root or None)
+    store, root = _get_store(repo_root or None)
     try:
-        raw = find_knowledge_gaps(store)
+        raw = find_knowledge_gaps(store, repo_root=root)
         # Totals must come from the untruncated lists: the summary counts are
         # the whole point of the tool, and capping them would hide the gap.
         totals = {category: len(rows) for category, rows in raw.items()}
@@ -186,9 +189,9 @@ def get_knowledge_gaps_func(
             "total_gaps": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "refactor dead_code -- find unused symbols",
-                "get_hub_nodes -- find high-impact nodes",
-                "get_suggested_questions -- review prompts",
+                "refactor_tool dead_code -- find unused symbols",
+                "get_hub_nodes_tool -- find high-impact nodes",
+                "get_suggested_questions_tool -- review prompts",
             ],
         }
     finally:
@@ -237,9 +240,9 @@ def get_surprising_connections_func(
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_architecture_overview -- community structure",
-                "query_graph callers_of -- trace the coupling",
-                "get_bridge_nodes -- find chokepoints",
+                "get_architecture_overview_tool -- community structure",
+                "query_graph_tool callers_of -- trace the coupling",
+                "get_bridge_nodes_tool -- find chokepoints",
             ],
         }
     finally:
@@ -279,9 +282,9 @@ def get_suggested_questions_func(
                 k: len(v) for k, v in by_priority.items()
             },
             "next_tool_suggestions": [
-                "get_knowledge_gaps -- structural weaknesses",
-                "detect_changes -- risk-scored review",
-                "get_architecture_overview -- community map",
+                "get_knowledge_gaps_tool -- structural weaknesses",
+                "detect_changes_tool -- risk-scored review",
+                "get_architecture_overview_tool -- community map",
             ],
         }
     finally:

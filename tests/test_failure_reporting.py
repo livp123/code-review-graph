@@ -128,6 +128,37 @@ def test_a_newer_schema_is_refused_with_both_versions(tmp_path):
     assert "newer" in message
 
 
+def test_a_newer_schema_names_this_copy_and_how_to_find_the_others(tmp_path):
+    """"Upgrade code-review-graph" did not say which copy (developer-experience review, item 13).
+
+    The usual cause is two installs: the MCP entry runs one, the shell another.
+    The refusal names the running version and where it lives, and points at
+    the command that lists every copy.
+    """
+    from pathlib import Path
+
+    import code_review_graph
+    from code_review_graph import __version__
+
+    db = _built_db(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+        (str(LATEST_VERSION + 1),),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(GraphStoreError) as caught:
+        GraphStore(db)
+    message = str(caught.value)
+    package_dir = Path(code_review_graph.__file__).resolve().parent
+    assert f"This is code-review-graph {__version__} at {package_dir}." in message
+    assert "code-review-graph doctor" in message
+    # The sample in docs/TROUBLESHOOTING.md quotes this part word for word.
+    assert f"this build understands v{LATEST_VERSION})." in message
+
+
 def test_an_empty_file_is_still_a_new_database(tmp_path):
     """SQLite's own rule, and the one `build` relies on. Not corruption."""
     db = _built_db(tmp_path)
@@ -351,12 +382,7 @@ def test_the_timeout_message_names_the_knob(git_repo):
 
 
 def test_a_base_ref_that_does_not_resolve_is_not_an_unrunnable_git(git_repo):
-    """A repository with no commits still has to work.
-
-    ``require_vcs`` is about a VCS that could not be run at all. A base ref
-    that simply is not there keeps the documented ``--cached`` fallback, or
-    ``detect-changes`` would fail on every fresh ``git init``.
-    """
+    """An unresolved base falls back to staged, unstaged, and untracked files."""
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -364,13 +390,15 @@ def test_a_base_ref_that_does_not_resolve_is_not_an_unrunnable_git(git_repo):
 
         class _Result:
             returncode = 128 if len(calls) == 1 else 0
-            stdout = b""
+            stdout = b"" if len(calls) == 1 else b" M tracked.py\0?? new.py\0"
 
         return _Result()
 
     with patch("code_review_graph.incremental.subprocess.run", side_effect=fake_run):
-        assert get_changed_files(git_repo, "HEAD~1", require_vcs=True) == []
-    assert len(calls) == 2, "the --cached fallback was skipped"
+        assert get_changed_files(git_repo, "HEAD~1", require_vcs=True) == ["tracked.py", "new.py"]
+    assert len(calls) == 2
+    assert calls[1][:2] == ["git", "status"]
+    assert "--untracked-files=all" in calls[1]
 
 
 def test_analyze_changes_degrades_rather_than_failing_on_a_partial_diff(tmp_path):

@@ -1,11 +1,10 @@
 # FAQ: how code-review-graph compares
 
-Where another tool is better for a job, this page says so.
+This page says what code-review-graph is good at, and when it is not worth using.
 
 - [How is this different from LSP and language servers?](#how-is-this-different-from-lsp-and-language-servers)
 - [Isn't this just RAG?](#isnt-this-just-rag)
 - [Why not just grep?](#why-not-just-grep)
-- [How does it compare to Serena, codegraph, claude-context, and repomix?](#how-does-it-compare-to-serena-codegraph-claude-context-and-repomix)
 - [When should I not use it?](#when-should-i-not-use-it)
 - [Does it phone home?](#does-it-phone-home)
 - [How do I verify it is working?](#how-do-i-verify-it-is-working)
@@ -39,7 +38,7 @@ language server.
 **Trade-off.** CRG's call resolution is AST-level and heuristic, not
 compiler-backed. Dynamic dispatch, metaprogramming and duck typing produce
 inferred edges, so every edge carries a confidence tier
-(`EXTRACTED` or `INFERRED`). LSP is more precise per symbol; CRG is
+(`EXTRACTED`, `INFERRED`, `AMBIGUOUS` or `UNRESOLVED`). LSP is more precise per symbol; CRG is
 broader, persistent and cheaper to query across the repository.
 
 ## Isn't this just RAG?
@@ -63,8 +62,8 @@ Similarity retrieval has no second hop.
 
 **Where RAG-style search is better:** conceptual questions over prose, comments
 and docs ("where is rate limiting discussed?"). CRG's own keyword ranking is a
-known weakness (MRR 0.35; see the limitations in the
-[README](../README.md#benchmarks)).
+known weakness (see the limitations in the
+[README](../README.md#limitations)).
 
 ## Why not just grep?
 
@@ -85,37 +84,22 @@ of grep, read and reasoning:
   false hits the agent has to read to rule out.
 - Tests for: `query_graph_tool(pattern="tests_for")` maps code to tests through
   parsed edges and naming conventions; `detect_changes_tool` adds transitive
-  coverage. Grep only finds tests that mention the name literally.
+  coverage. A row found by name, or by a PHP call the graph could not pin to one
+  class, carries `inferred_by` and is a guess, not coverage. Grep only finds
+  tests that mention the name literally.
 - Affected flows: "which execution paths does this change touch?" has no grep
   equivalent.
 
 The graph also persists. Agentic search re-derives the same structure every
 session.
 
-One caveat on the numbers: the whole-corpus token-reduction figures (about 65x
-median, 36x to 376x range) compare a graph response with reading the whole
-corpus, not with a skilled agentic-grep session (see
-[REPRODUCING.md](REPRODUCING.md) for what each benchmark measures). For
-single-hop lookups in a small repository, grep is cheap and good.
-
-## How does it compare to Serena, codegraph, claude-context, and repomix?
-
-These solve adjacent problems. The table is based on each project's public
-documentation; check upstream for current behaviour.
-
-| Tool | Approach | Persistence | External deps | Review focus |
-|---|---|---|---|---|
-| **code-review-graph** | Tree-sitter AST to structural graph (calls, imports, inheritance, tests) over MCP and CLI | SQLite in `.code-review-graph/`, incremental updates | None for the core; embeddings optional | Yes: blast radius, risk-scored change analysis, test-gap detection |
-| **Serena** | LSP-backed symbol retrieval and editing tools over MCP | Language-server state plus per-project memories | A language server per language | General coding-agent toolkit, not review-specific |
-| **codegraph** | AST/call-graph indexing over MCP (several projects share this name) | Varies by implementation | Varies by implementation | Retrieval-focused |
-| **claude-context** | Chunk and embed semantic code search over MCP | Vector index in a vector database | Embedding provider plus vector DB | Search-focused, not review-specific |
-| **repomix** | Packs the whole repository into one file for an LLM | None; regenerated per run | Node.js | One-shot context packing; no structural queries |
-
-If you want symbol-precise editing tools, Serena's LSP approach fits better.
-If you want semantic search and can run a vector store, claude-context covers
-that. If the repository fits in one context window, repomix is the simplest
-option. CRG's niche is a persistent structural graph for review: impact
-analysis, risk scoring and test-coverage tracing with no external services.
+One caveat on the numbers: the whole-corpus token-reduction figures (about 63x
+median, 35x to 358x range) compare a graph response with reading the whole
+corpus, not with a skilled agentic-grep session. Against an agent that greps
+and reads the top 3 files, the median is 6.65x (range 4.2x to 72.6x, across 18
+questions on 6 repositories); see [REPRODUCING.md](REPRODUCING.md) for what
+each benchmark measures. For single-hop lookups in a small repository, grep is
+cheap and good.
 
 ## When should I not use it?
 
@@ -129,8 +113,7 @@ analysis, risk scoring and test-coverage tracing with no external services.
 - One-off questions on a repository you will not revisit. The payoff comes from
   reuse across queries and sessions.
 - Flow detection on JavaScript and Go. Entry-point detection is reliable mainly
-  for Python and PHP/Laravel patterns; overall flow recall is 33% (see the
-  README limitations).
+  for Python and PHP/Laravel patterns (see the README limitations).
 
 ## Does it phone home?
 
@@ -149,32 +132,47 @@ The only network activity is opt-in:
   egress warning on stderr until you set `CRG_ACCEPT_CLOUD_EMBEDDINGS=1`; the
   warning is skipped when the endpoint is localhost.
 
+The context history log (`CRG_CONTEXT_HISTORY=1`) is off by default and is a
+local file only.
+
 See [LEGAL.md](LEGAL.md).
 
 ## How do I verify it is working?
 
-1. Check the graph:
+1. Check the setup:
+
+   ```bash
+   code-review-graph doctor
+   ```
+
+   It changes nothing. It checks every copy on your `PATH`, the version each
+   MCP entry and hook runs, and whether the graph is there and built at HEAD.
+   It ends with `All good.`, or names each problem with a fix and exits 1.
+
+2. Check the graph:
 
    ```bash
    code-review-graph status
    ```
 
-   It prints `Nodes`, `Edges` and `Files`. Zero nodes means the build did not
-   run or found nothing to parse.
+   It prints `Nodes`, `Edges` and `Files`. If you have not built yet, it prints
+   `No graph found at <path>` instead. Zero nodes means the build did not run
+   (`Last updated: never`) or found nothing to parse.
 
-2. See the savings on a real change. Edit something, then:
+3. See the savings on a real change. Edit something, then:
 
    ```bash
    code-review-graph detect-changes --brief
    ```
 
-   This prints the risk summary and the Token Savings panel against the
-   existing graph without re-parsing. Add `--verify` to compare the estimate
-   with the `cl100k_base` tokenizer (`pip install tiktoken`). If the graph may
-   be stale, `code-review-graph update --brief` re-parses changed files first
-   and prints the same panel.
+   This prints the risk summary, the top three things to review, and the
+   Token Savings panel against the existing graph without re-parsing. Add
+   `--verify` to compare the estimate with the `cl100k_base` tokenizer
+   (`pip install tiktoken`). If the graph may be stale,
+   `code-review-graph update --brief` re-parses changed files first and prints
+   the same panel.
 
-3. Check the MCP wiring. In Claude Code run `/mcp` and confirm
+4. Check the MCP wiring. In Claude Code run `/mcp` and confirm
    `code-review-graph` is connected. Ask something structural ("what calls
    `parse_file`?") and watch the assistant call `query_graph_tool` instead of
    grepping.
@@ -188,7 +186,7 @@ If any step fails, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
   response can cost more tokens than it saves (see
   [When should I not use it?](#when-should-i-not-use-it)).
 - A few hundred files and up: the six evaluation repositories (express,
-  fastapi, flask, gin, httpx and code-review-graph) show 36x to 376x reductions
+  fastapi, flask, gin, httpx and code-review-graph) show 35x to 358x reductions
   on whole-corpus questions, with the caveat above about the baseline.
 - Multi-thousand-file repositories and monorepos: the strongest case. No agent
   can read the corpus per question (FastAPI alone is about 950k tokens of
@@ -200,18 +198,33 @@ more than a 3,000-file repository you touch once.
 ## How does it handle monorepos, git worktrees, and multiple repos?
 
 **Monorepos.** One graph per repository root. Commands find the root by walking
-up to the nearest `.git`, and in git repositories only tracked files
-(`git ls-files`) are indexed, so gitignored build output is skipped. Use
-`.code-review-graphignore` to exclude tracked paths (`vendor/**`, generated
-code), or pass `--repo <path>` to point a command at a specific directory.
+up to the nearest `.git`, and in git repositories only tracked files and
+untracked files git does not ignore are indexed, so gitignored build output is
+skipped. Use `.code-review-graphignore` to exclude other paths (`vendor/**`,
+generated code), or pass `--repo <path>` to point a command at a specific
+directory. Imports between npm, yarn and pnpm workspace packages resolve to the
+package's source files, so `importers_of` and the impact radius cross package
+boundaries.
 
 **Git worktrees.** Each worktree is its own root and gets its own
 `.code-review-graph/` matching its checkout. Do not share one database across
 worktrees at different commits. The pre-commit hook skips linked worktrees
 unless `CRG_HOOK_WORKTREES=1` is set, so a commit there does not build a second
-graph by accident. To keep the database outside the working tree (ephemeral
-workspaces, network shares), pass `--data-dir <path>` to `build`, `update`,
-`status` and the other graph commands, or set `CRG_DATA_DIR`.
+graph by accident. The edit hook updates the graph of the repository that
+holds the edited file, so a session in the main checkout that edits a worktree
+updates the worktree's graph, once you have built one there. To keep the
+database outside the working tree (ephemeral workspaces, network shares), pass
+`--data-dir <path>` to `build` or `update` (the path is saved in the registry,
+so later commands find it), or set `CRG_DATA_DIR`.
+
+For parallel PR reviews in one stdio MCP session, use the opt-in
+`code-review-graph serve --multi-worktree --repo <primary-root>` mode. Each
+tool call must pass the linked worktree root in `repo_root`; the server routes
+it to a child MCP process dedicated to that worktree. The router authorises
+only the primary root and active linked worktrees from the same Git common
+directory, and starts children lazily. Do not use `CRG_DATA_DIR` with this
+mode; use one Registry `data_dir` per worktree when graph files must live
+outside the checkouts.
 
 **Multiple repos.** A registry at `~/.code-review-graph/registry.json` (or
 under `$CRG_HOME`) lets MCP clients search across projects:
@@ -223,7 +236,11 @@ code-review-graph unregister api                    # remove by path or alias
 ```
 
 Once registered, `list_repos_tool` and `cross_repo_search_tool` work across
-all of them. To keep several graphs current, the daemon watches registered
+all of them. One HTTP server can also answer for all of them:
+`code-review-graph serve --http --multi-repo` serves every registered repository
+and loads the embedding model once. Each tool call must then pass `repo_root`,
+the absolute path of a registered repository; a call without one, or naming a
+repository that is not registered, is refused. To keep several graphs current, the daemon watches registered
 repositories as child processes:
 
 ```bash
@@ -234,3 +251,11 @@ crg-daemon status
 
 Also available as `code-review-graph daemon start|stop|status`. See
 [COMMANDS.md](COMMANDS.md) for the daemon reference.
+
+**A folder of sibling repos, or nested repos.** Build each repo you want a
+graph for, inside that repo. The edit hook that `install` writes for Claude
+Code, Qoder and CodeBuddy then updates the graph of the repo that holds each
+edited file, even when the session started in the outer folder. It never
+builds a graph for a repo that has none, unless the session started in that
+repo. MCP tool calls still act on the server's default repo unless they pass
+`repo_root`.

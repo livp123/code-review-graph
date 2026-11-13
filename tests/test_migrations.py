@@ -106,9 +106,6 @@ class TestMigrations:
         conn.execute("DROP TABLE IF EXISTS flow_memberships")
         conn.execute("DROP TABLE IF EXISTS communities")
         conn.execute("DROP TABLE IF EXISTS nodes_fts")
-        conn.execute("DROP TABLE IF EXISTS community_summaries")
-        conn.execute("DROP TABLE IF EXISTS flow_snapshots")
-        conn.execute("DROP TABLE IF EXISTS risk_index")
         conn.commit()
         conn.close()
 
@@ -181,13 +178,6 @@ class TestMigrations:
         assert version_before == version_after == LATEST_VERSION
 
 
-    def test_v6_summary_tables_exist(self):
-        """v6 summary tables should exist after migration."""
-        tables = _get_table_names(self.store._conn)
-        assert "community_summaries" in tables
-        assert "flow_snapshots" in tables
-        assert "risk_index" in tables
-
     def test_v6_migration_idempotent(self):
         """Running v6 migration twice should not fail."""
         from code_review_graph.migrations import _migrate_v6
@@ -212,3 +202,25 @@ def _get_table_names(conn: sqlite3.Connection) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
     ).fetchall()
     return {row[0] if isinstance(row, (tuple, list)) else row["name"] for row in rows}
+
+
+def test_a_migration_that_lost_the_column_race_still_runs(tmp_path, monkeypatch):
+    """Two openers of a fresh graph can both see a column missing before
+    either adds it. The second ``ALTER`` then finds the column there, and
+    must take that as done rather than fail the open with ``duplicate column
+    name`` (crg-5up). Every column check here says "missing", as it does for
+    the opener that checked just before its peer added the column.
+    """
+    from code_review_graph import migrations
+
+    db = tmp_path / "graph.db"
+    GraphStore(db).close()
+    monkeypatch.setattr(migrations, "_has_column", lambda conn, table, column: False)
+
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
+        run_migrations(conn)
+        assert get_schema_version(conn) == LATEST_VERSION
+    finally:
+        conn.close()

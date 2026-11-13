@@ -343,9 +343,6 @@ class TestPassOrdering:
         monkeypatch.setattr(
             "code_review_graph.communities.store_communities", lambda s, c: 0,
         )
-        monkeypatch.setattr(
-            "code_review_graph.tools.build._compute_summaries", lambda s: None,
-        )
 
     def test_zls_runs_before_the_stages_that_read_its_edges(
         self, store, tmp_path, monkeypatch,

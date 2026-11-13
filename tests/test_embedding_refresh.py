@@ -186,13 +186,14 @@ class TestEmbeddingNodeEnumeration:
         graph.commit()
         db_path = graph.db_path
         graph.close()
+        (tmp_path / ".code-review-graph").mkdir(exist_ok=True)
         provider = _StubProvider()
         with (
             patch("code_review_graph.embeddings.get_provider", return_value=provider),
             patch("code_review_graph.tools.docs.get_db_path", return_value=db_path),
             patch(
                 "code_review_graph.tools.docs._get_store",
-                side_effect=lambda root: (GraphStore(db_path), tmp_path),
+                side_effect=lambda root, **_kw: (GraphStore(db_path), tmp_path),
             ),
         ):
             first = embed_graph(str(tmp_path))
@@ -391,17 +392,13 @@ class TestRefreshWithoutVectors:
         finally:
             graph.close()
 
-    def test_run_postprocess_reports_skip(self, tmp_path):
+    def test_run_postprocess_reports_skip(self, tmp_path, monkeypatch):
         graph = _graph_without_vectors(tmp_path, empty_table=False)
         db_path = graph.db_path
         graph.close()
-        with (
-            patch("code_review_graph.embeddings.get_provider") as get_provider,
-            patch(
-                "code_review_graph.tools.build._get_store",
-                side_effect=lambda root: (GraphStore(db_path), tmp_path),
-            ),
-        ):
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setenv("CRG_DATA_DIR", str(db_path.parent))
+        with patch("code_review_graph.embeddings.get_provider") as get_provider:
             result = run_postprocess(
                 repo_root=str(tmp_path),
                 embedding_provider="local",
@@ -610,9 +607,8 @@ class TestRefreshWiring:
         finally:
             graph.close()
 
-    def test_mcp_build_and_postprocess_forward_exact_scope(self):
-        from code_review_graph import main as crg_main
-
+    @staticmethod
+    def _invoke_mcp_tools_with_embedding_scope(crg_main):
         build_tool = getattr(
             crg_main.build_or_update_graph_tool,
             "fn",
@@ -623,6 +619,7 @@ class TestRefreshWiring:
             "fn",
             crg_main.run_postprocess_tool,
         )
+
         with (
             patch.object(
                 crg_main,
@@ -655,19 +652,26 @@ class TestRefreshWiring:
                 )
             )
 
+        return build, postprocess
+
+    def test_mcp_build_and_postprocess_forward_exact_scope(self):
+        from code_review_graph import main as crg_main
+
+        build, postprocess = self._invoke_mcp_tools_with_embedding_scope(crg_main)
+
         assert build.call_args.kwargs["embedding_provider"] == "local"
         assert build.call_args.kwargs["embedding_model"] == "test-model"
         assert postprocess.call_args.kwargs["embedding_provider"] == "local"
         assert postprocess.call_args.kwargs["embedding_model"] == "test-model"
 
-    def test_cli_build_forwards_exact_scope(self):
+    def test_cli_build_forwards_exact_scope(self, tmp_path):
         from code_review_graph import cli
 
         argv = [
             "code-review-graph",
             "build",
             "--repo",
-            "repo-root",
+            str(tmp_path),
             "--embedding-provider",
             "local",
             "--embedding-model",
@@ -693,9 +697,11 @@ class TestRefreshWiring:
 
         build.assert_called_once_with(
             full_rebuild=True,
-            repo_root=str(Path("repo-root").resolve()),
+            recover_corrupt=True,
+            repo_root=str(tmp_path.resolve()),
             postprocess="full",
             zls=False,
+            wait_for_lock=False,
             embedding_provider="local",
             embedding_model="test-model",
         )

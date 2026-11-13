@@ -9,6 +9,14 @@ uv sync --extra dev                  # requires uv
 uv run pytest tests/ --tb=short -q   # check the setup
 ```
 
+`uv sync` uses the newest Python it finds. CI tests 3.10 to 3.13, so add
+`--python 3.13` to `uv sync` to match it.
+
+You can run `install` inside this checkout: the root `.gitignore` lists what
+each platform writes here. Claude Code, CodeBuddy, Antigravity and Gemini CLI
+also change the tracked `CLAUDE.md`, `GEMINI.md` or `.mcp.json`; do not commit
+those changes by accident.
+
 ## Running Tests
 
 ```bash
@@ -22,7 +30,7 @@ CI runs the suite on Python 3.10, 3.11, 3.12 and 3.13 and fails below 65% covera
 `tests/test_parser_grammar_contract.py` checks every built-in class, function, import,
 and call dispatch name against its bundled Tree-sitter grammar. When updating a grammar
 or adding dispatch entries, use the grammar's actual named node types. This contract
-checks configured dispatch names; language fixtures still verify extraction behavior.
+checks configured dispatch names; language fixtures still verify extraction behaviour.
 
 ## Linting and Type Checking
 
@@ -32,6 +40,8 @@ uv run mypy code_review_graph/ --ignore-missing-imports --no-strict-optional
 ```
 
 CI also runs `bandit -r code_review_graph/ -c pyproject.toml` and checks that `LATEST_VERSION` in `code_review_graph/migrations.py` equals `SUPPORTED_SCHEMA_VERSION` in the VS Code extension.
+
+The `minimum-dependencies` job installs every direct dependency at the lowest version `pyproject.toml` allows, from `.github/requirements-minimum.txt`, and runs the tests on each supported Python. If you add a dependency or change its lower bound, change that file too; `tests/test_dependency_floors.py` fails if the two disagree.
 
 ## Code Style
 
@@ -45,7 +55,7 @@ CI also runs `bandit -r code_review_graph/ -c pyproject.toml` and checks that `L
 1. Fork the repository and create a branch from `staging`: `git checkout -b feature/your-feature origin/staging`.
 2. Make the change and add tests for new behaviour.
 3. Run the tests, ruff and mypy as above.
-4. Update docs where behaviour changed (README, `docs/`, docstrings).
+4. Update docs where behaviour changed (README, `docs/`, docstrings). README.md has four translations: README.zh-CN.md, README.ja-JP.md, README.ko-KR.md and README.hi-IN.md. If you add or remove a heading, change a code block or a link, or add or remove a table row in README.md, make the same change in all four. `tests/test_readme_parity.py` checks this. Add a bullet under `## [Unreleased]` in `CHANGELOG.md` for anything a user will notice, in user terms, not function names. Changes only contributors see (tests, CI, internal names) go under `### Internal`.
 5. Open a pull request against `staging` (the default branch, so GitHub picks it for you). The template asks for the linked issue, what changed and why, and the commands you ran.
 
 ## Branching and promotion
@@ -59,7 +69,7 @@ feature branch --PR--> staging --PR--> testing --PR--> main --tag--> PyPI
 | Branch    | Purpose                                                        | Who merges into it                      |
 | --------- | -------------------------------------------------------------- | --------------------------------------- |
 | `staging` | Default branch. Every feature and fix PR lands here first.     | Maintainers, once CI is green.          |
-| `testing` | Candidate for the next release. Gets a longer soak and manual QA. | The `Auto promote` workflow, once a day, when `staging` is green. |
+| `testing` | Candidate for the next release. Gets a longer soak and manual QA. | Maintainer only, by hand, via a promotion PR from `staging`. |
 | `main`    | Released code. Nothing reaches `main` without passing QA on `testing`. | Maintainer only, by hand, via a promotion PR from `testing`. |
 
 Rules that apply to all three branches (enforced by repository rulesets):
@@ -85,61 +95,20 @@ allow no other merge method. Opening a promotion PR re-queues every required che
 commit that already had them green from the push run, so the PR sits blocked for a
 quarter of an hour or so before it can be merged. That is normal.
 
-`staging` → `testing` happens by itself. `testing` → `main` never does.
+**No promotion is automatic.** Green checks are necessary but not sufficient: a person
+reviews and merges every promotion, and no workflow may merge a pull request.
+`tests/test_promotion_is_manual.py` fails if one tries.
 
-### Automatic promotion to `testing`
+**Promotion to `testing`.** Open it with `gh pr create --base testing --head staging`, read
+what it brings in, wait for the required checks, and merge it yourself with a merge commit.
+The `Promote` workflow in the Actions tab can open the PR instead, but it needs Settings →
+Actions → General → Workflow permissions → **Allow GitHub Actions to create and approve pull
+requests**, which is off here on purpose. Merging into `testing` starts the promotion gate.
 
-`.github/workflows/auto-promote.yml` runs once a day. If `staging` has commits `testing`
-does not, every required status check is green on the `staging` tip, and the promotion
-gate has not failed on the current `testing` tip, it opens the promotion PR and merges it
-with a merge commit. It writes a summary on every run, including the runs that decide to
-do nothing, so "nothing to promote" is never indistinguishable from "did not run".
-
-**One repository setting is required.** Settings → Actions → General → Workflow
-permissions → tick **Allow GitHub Actions to create and approve pull requests** → Save.
-Without it `gh pr create` is refused and no promotion PR can be opened — by this workflow
-or by the manual `Promote` one. Leave *Workflow permissions* itself on **Read repository
-contents and packages permissions**: both workflows ask for the writes they need in their
-own `permissions:` block. If the tick is missing, the run goes red and the job summary
-gives that click path.
-
-It merges only a PR it opened itself: same repository, `staging` → `testing`, carrying the
-`auto-promotion` label, and at the commit whose checks were read. `gh pr list --head
-staging` matches a branch of that name in any of this repository's forks, and a PR's base
-branch can be changed by its author at any time without re-running a single check, so all
-of that is verified again immediately before the merge, and the merge itself is pinned
-with `--match-head-commit`. **A promotion PR you opened by hand is never touched** — it
-has no `auto-promotion` label, so the daily run refuses it by number and says so.
-
-It stops, without failing, when there is nothing to promote, when CI is still running,
-when a required check failed or was skipped, when the promotion gate is still running on
-`testing`, when the gate failed there, or when `staging` moved mid-run. Those states are
-reported elsewhere already and tomorrow's run looks again. Three things turn the run red,
-because nothing else reports them:
-
-- **GitHub refused the merge.** The PR is left open and the refusal is quoted in the job
-  summary, with the causes listed in the order they actually occur; merge it by hand with
-  a merge commit.
-- **The workflow is stuck on its own PR** — it conflicts, it is a draft, or GitHub holds
-  it for a rule with every required check green. A stalled promotion that reported itself
-  as a green warning every morning would stay stalled for ever.
-- **A PR it was about to merge is not the one it decided on**, or the release gate could
-  not be started after the merge.
-
-Every rule lives in `scripts/auto_promote.py` and is covered by
-`tests/test_auto_promote.py`; the workflow fetches facts and obeys. The required contexts
-are read from the `testing` ruleset at run time, so a renamed CI job cannot silently drop
-out of the gate. The workflow has no input, variable or code path that can target `main`,
-the PR it merges is re-checked at the door, and the tests assert both.
-
-To see what it would decide without it doing anything, run the `Auto promote` workflow
-from the Actions tab: a hand-started run defaults to a dry run.
-
-**Promotion to `main` is never automatic.** Open it from the Actions tab (`Promote`
-workflow, pick `testing -> main`) or by hand with
-`gh pr create --base main --head testing`, read the promotion gate's verdict first, and
-merge it yourself. That is the maintainer's sign-off: CI green is necessary but not
-sufficient.
+**Promotion to `main` is never automatic.** Open it by hand with
+`gh pr create --base main --head testing` (the `Promote` workflow, `testing -> main`, needs
+the same setting as above), read the promotion gate's verdict first, and merge it
+yourself. That is the maintainer's sign-off: CI green is necessary but not sufficient.
 
 **Hotfixes** for a released version follow the same path. If a fix is urgent, open the PR
 against `staging` and promote twice in a row; do not open PRs against `main`.
@@ -202,8 +171,7 @@ it). The report names every check, whether it passed, and for a failure the exac
 assertion that moved: for example the property, its baseline and the measured delta.
 
 The gate opens no pull request and merges nothing. Promotion to `main` stays the
-maintainer's decision, made with the `Promote` workflow as before. `Auto promote` cannot
-reach `main` either: it promotes `staging` to `testing` and nothing else.
+maintainer's decision.
 
 To run any of these by hand:
 
@@ -212,13 +180,18 @@ CRG_UPGRADE_TEST=1 uv run pytest -m upgrade -q -rxX   # upgrade-path
 uv run pytest tests/test_packaging.py -m packaging -q # packaging
 uv run pytest -m determinism -q -rxX                  # determinism
 uv run pytest -m corpus -q                            # corpus (clones 8 repos)
-uv run pytest -m browser -q                           # browser (needs the browser-test extra)
+uv run pytest -m browser -q                           # browser (needs the browser-test extra and `uv run python -m playwright install chromium`)
 uv run pytest -m e2e -q                               # e2e
 ```
 
-**Releases** are cut from `main` only: bump the version, tag `vX.Y.Z`, publish a GitHub
-release, and the `publish` workflow uploads to PyPI. Nothing is ever released from
-`staging` or `testing`.
+**Releases** are cut from `main` only: move the `[Unreleased]` notes in `CHANGELOG.md`
+under the new version, update `docs/FEATURES.md`, bump the version, tag `vX.Y.Z`, publish
+a GitHub release, and the `publish` workflow uploads to PyPI. When
+`SUPPORTED_SCHEMA_VERSION` in the VS Code extension changes, publish the extension in the
+same release and add its row to the Versions table in `code-review-graph-vscode/README.md`:
+the `publish` workflow does not ship it, and an older extension cannot read the new graph.
+Nothing is ever released from `staging` or `testing`. The full steps are in
+[docs/RELEASING.md](docs/RELEASING.md).
 
 **Archived branches.** Old branches are not deleted outright. A branch that carried work
 not on `main` is kept as a tag under `archive/<branch-name>` (list them with
@@ -241,6 +214,8 @@ docs/                      # user documentation
 skills/                    # shipped agent skills, bundled into the wheel
 ```
 
+The text of `skills/build-graph`, `skills/review-delta` and `skills/review-pr` lives in `DOCUMENTARY_SKILLS` in `code_review_graph/skills.py`. Edit it there, then run `uv run python scripts/generate_documentary_skills.py`; a test fails if the files drift. The other four (`debug-issue`, `explore-codebase`, `refactor-safely`, `review-changes`) come from `_SKILLS` in the same file, which `install` writes out; change the text there and in `skills/<name>/SKILL.md` together, as `tests/test_skill_template_schema_sync.py` checks that they match byte for byte.
+
 ## Adding Language Support
 
 If you only need a language for your own repository, you may not need to change this project: add a `.code-review-graph/languages.toml` that maps extensions and node types to any grammar in tree-sitter-language-pack (see [docs/CUSTOM_LANGUAGES.md](docs/CUSTOM_LANGUAGES.md)). To add built-in support:
@@ -250,6 +225,12 @@ If you only need a language for your own repository, you may not need to change 
 3. Add a sample file in `tests/fixtures/`.
 4. Add parsing tests in `tests/test_multilang.py`.
 
+Robot Framework is a built-in structural fallback rather than a Tree-sitter
+grammar. Its `.robot` and `.resource` files are handled in `parser.py`, where
+tests, user keywords, keyword calls, and `Resource`/`Library`/`Variables`
+settings are extracted. Changes to this support should include focused tests
+for both extensions in `tests/test_parser.py`.
+
 ## Adding a Platform Target
 
 Every supported AI tool is permanent maintenance surface: its config path, schema, install merge, uninstall and tests have to keep working on every release. Some existing targets were merged without evidence that they worked in a released client, and those are the ones that break. New targets are held to the bar below.
@@ -258,11 +239,11 @@ Start with a platform request issue (https://github.com/tirth8205/code-review-gr
 
 1. A link to the platform's official MCP configuration documentation. Blog posts, forum replies and screenshots of a settings dialog are not enough.
 2. The exact config file path and the exact schema of a server entry: which top-level key holds the servers, whether that value is an object or an array, and whether a `type` field is required.
-3. The entry added through the existing `PLATFORMS` table in `code_review_graph/skills.py`, plus `_PLATFORM_CHOICES` in `code_review_graph/cli.py`. Use the fields already there: `name`, `config_path`, `key`, `detect`, `format`, `needs_type`, and where needed `legacy_keys`, `server_type`, `entry_fields`. If the client needs something the table cannot express, say so in the pull request and explain why, rather than adding a separate code path beside it.
+3. The entry added through the existing `PLATFORMS` table in `code_review_graph/skills.py`, plus `_PLATFORM_CHOICES` in `code_review_graph/cli.py`. Use the fields already there: `name`, `config_path`, `key`, `detect`, `format`, `needs_type`, and where needed `config_paths`, `legacy_keys`, `server_type`, `entry_fields`. If the client needs something the table cannot express, say so in the pull request and explain why, rather than adding a separate code path beside it.
 4. Preservation of unrelated user settings. Install must merge only the `code-review-graph` server entry and leave every other server, key and top-level setting intact. If the file cannot be parsed, install must skip it rather than rewrite it.
 5. A byte-idempotent reinstall. Running install twice must leave the config file and any generated instruction file byte for byte identical.
 6. A working uninstall in `code_review_graph/uninstall.py` that removes only what install added, including any legacy keys, and leaves the rest of the file untouched.
-7. Lifecycle tests matching the existing ones: an install, reinstall and uninstall test in `tests/test_cli_install.py` shaped like `test_copilot_cli_install_reinstall_uninstall_lifecycle`, and a passing run of the all-platforms sweep in `tests/test_uninstall.py` (`test_uninstall_removes_mcp_entry_for_every_current_platform_spec`), which covers every new entry automatically.
+7. Lifecycle tests matching the existing ones: an install, reinstall and uninstall test in `tests/test_cli_install.py` shaped like `test_copilot_cli_install_reinstall_uninstall_lifecycle`, and a passing run of the all-platforms sweep in `tests/test_uninstall.py` (`test_uninstall_removes_mcp_entry_for_every_current_platform_spec`), which covers every new entry automatically. Also add the platform to `EXPECTATIONS` in `tests/test_platform_lifecycle.py` (and raise the platform count there), add its key to the `--platform` list in README.md and its translations, and list every file it writes inside the repository in the root `.gitignore`; `tests/test_platform_lifecycle.py -m platform_lifecycle` and `tests/test_install_outputs_are_ignored.py` fail otherwise.
 8. Evidence from a real released client: a screenshot or transcript of a session in that client where a code-review-graph tool is invoked and returns a result. A rendered image of text, a mockup or a description of what should happen is not evidence.
 
 If no maintainer can install and run the client, the request may be declined or left open until someone who uses it is willing to own it and respond when it breaks. An existing target may also be removed if it breaks and nobody steps up to fix it.

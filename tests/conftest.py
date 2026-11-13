@@ -1,17 +1,29 @@
 """Shared test fixtures.
 
-Keeps code-review-graph's own per-user state out of the developer's real
-home directory. Scoped deliberately: the editor-integration installers in
-``skills.py`` write to other user-level locations (``~/.codex``,
-``~/.cursor``, ``~/.config/opencode``) that are outside CRG state and are
-not covered here — those tests patch ``Path.home()`` themselves.
+Keeps code-review-graph's own per-user state, and every user-level config
+the installers in ``skills.py`` write (``~/.codex``, ``~/.cursor``,
+``~/.config/opencode`` and the rest), out of the developer's real home
+directory: each test runs with a temporary home.
 """
 
 from __future__ import annotations
 
+import importlib
 import os
+import pkgutil
 
 import pytest
+
+import code_review_graph.tools
+
+# The tool modules load on first use (#1139). A test that patches a name such
+# as ``code_review_graph.graph.GraphStore`` while one of them loads for the
+# first time leaves its mock bound there for every later test. Load them before
+# any test runs, as importing the package used to.
+for _module in ("incremental", "postprocessing"):
+    importlib.import_module(f"code_review_graph.{_module}")
+for _info in pkgutil.iter_modules(code_review_graph.tools.__path__):
+    importlib.import_module(f"code_review_graph.tools.{_info.name}")
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +53,39 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     # the variable to a temp directory instead of merely clearing it:
     # unset, a miss would be silently destructive; set, it cannot be.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
+    # Tests that exercise the Codex default patch Path.home() to a temporary
+    # directory; clear an external override so it cannot escape that scope.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    # DeepSeek Harness reads ``$DSH_HOME/cordis.patch.yml``, falling back to
+    # ``~/.dsh``. ``skills._dsh_home()`` prefers that variable over a patched
+    # ``Path.home()``, so a suite that only fakes the home would still edit
+    # the developer's real patch layer. Pin it here, exactly as the Hermes
+    # variable above.
+    monkeypatch.setenv("DSH_HOME", str(tmp_path_factory.mktemp("dsh-home")))
+    # The OpenCode plugin and MiMo config follow ``XDG_CONFIG_HOME`` over a
+    # patched ``Path.home()``, so a developer's own setting must not leak in.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    # A developer who records their own context history (#813) must not
+    # have the suite append lines to every scratch repository it builds.
+    monkeypatch.delenv("CRG_CONTEXT_HISTORY", raising=False)
+    # The installers write user-level configs under the home directory
+    # (``~/.codex``, ``~/.continue``, ``~/.qwen`` and more). Point the home
+    # at a temp directory, so a test that forgets to patch ``Path.home()``
+    # writes there and not into the real one (crg-2lp). ``Path.home()``
+    # reads ``HOME`` on POSIX and ``USERPROFILE`` on Windows.
+    user_home = tmp_path_factory.mktemp("user-home")
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    # These win over the home when set, so clear them: the folders they
+    # name then follow the temp home too.
+    for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "MIMOCODE_HOME", "CLAUDE_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    # Git reads its global config from the home as well. Give the temp one
+    # an identity, so a test commit works the same on every machine.
+    (user_home / ".gitconfig").write_text(
+        "[user]\n\tname = CRG Test\n\temail = crg-test@example.com\n",
+        encoding="utf-8",
+    )
     return home
 
 
@@ -60,6 +105,15 @@ _OPT_IN_MARKERS = frozenset({
 # Environment escape hatches, for suites that also need to be switchable on
 # without a ``-m`` expression (CI runs them alongside the ordinary suite).
 _OPT_IN_ENV_OVERRIDES = {"packaging": "CRG_RUN_PACKAGING_TESTS"}
+
+
+def pytest_configure(config):
+    # Parent runners (e.g. CLI wrappers) may inject GIT_CONFIG_* variables
+    # (such as diff.external="" or empty core.hooksPath) that break subprocess
+    # Git invocations in test fixtures.
+    for key in list(os.environ):
+        if key.startswith("GIT_CONFIG_"):
+            del os.environ[key]
 
 
 def pytest_collection_modifyitems(config, items):

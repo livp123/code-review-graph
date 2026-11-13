@@ -112,6 +112,10 @@ jobs:
         run: >-
           pytest --tb=short -q -m "not browser and not upgrade"
           --cov=code_review_graph --cov-report=term-missing --cov-fail-under=65
+      - name: Check writer locks with real parser processes
+        run: >-
+          pytest tests/test_concurrency_and_daemon.py -m concurrency
+          -k TestSingleFlightWriteLock -q --tb=short
 
   viz-browser:
     name: Visualization browser tests
@@ -127,8 +131,15 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install dependencies
         run: pip install -e ".[dev,browser-test]"
+      # The browser comes from Playwright's own download. Its extra Ubuntu
+      # packages (mostly fonts) come from the runner's mirror, which sometimes
+      # fails to resolve and then hangs for minutes; the hosted image already
+      # has the libraries Chromium needs, so cap that part and carry on.
       - name: Install Chromium
-        run: python -m playwright install --with-deps chromium
+        run: |
+          python -m playwright install chromium
+          timeout 180 python -m playwright install-deps chromium \
+            || echo "::warning::Ubuntu packages for Chromium did not install; using the image's own"
       # No coverage flag: this job runs a handful of end-to-end page tests and
       # would fail the 65% floor on its own.
       - name: Run browser tests
@@ -185,6 +196,30 @@ jobs:
         env:
           CRG_UPGRADE_TEST: "1"
         run: pytest -m upgrade -q -rxX
+
+  minimum-dependencies:
+    name: Minimum declared dependencies (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install every direct dependency at its declared floor
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" -r .github/requirements-minimum.txt
+      - name: Check dependency resolution
+        run: python -m pip check
+      - name: Print resolved direct versions
+        run: python scripts/print_minimum_dependencies.py
+      - name: Run tests at dependency floors
+        run: pytest --tb=short -q -m "not browser and not upgrade"
 
   google-embeddings:
     name: Google embeddings (${{ matrix.extra }})

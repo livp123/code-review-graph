@@ -23,8 +23,13 @@ from collections import deque
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
-from .flows import _has_framework_decorator, _matches_entry_name
-from .graph import GraphNode, GraphStore, _sanitize_name
+from .constants import (
+    CLAIMED_ENDPOINT_KEY,
+    INHERITED_ENDPOINT_KEY,
+    INHERITED_THROUGH_KEY,
+)
+from .flows import _has_framework_decorator, _has_override_decorator, _matches_entry_name
+from .graph import GraphNode, GraphStore, _compatible_edge_languages, _sanitize_name
 from .parser import _STORYBOOK_FILE_RE, CodeParser, normalize_file_path
 from .parser import is_test_file as _is_test_file
 from .parser import repo_relative_path as _repo_relative
@@ -59,6 +64,10 @@ _MOCK_NAME_RE = re.compile(
 
 _refactor_lock = threading.Lock()
 _pending_refactors: dict[str, dict] = {}
+# Edit files of a pending refactor that the graph reached through a followed
+# symlinked folder outside the repository (#269). Kept out of the preview so
+# it never reaches a tool response.
+_followed_edit_files: dict[str, frozenset[str]] = {}
 REFACTOR_EXPIRY_SECONDS = 600  # 10 minutes
 
 
@@ -71,6 +80,8 @@ def _cleanup_expired() -> int:
     ]
     for rid in expired:
         del _pending_refactors[rid]
+    for rid in [rid for rid in _followed_edit_files if rid not in _pending_refactors]:
+        del _followed_edit_files[rid]
     return len(expired)
 
 
@@ -1712,9 +1723,17 @@ def rename_preview(
         "created_at": time.time(),
     }
 
+    from .incremental import followed_files
+
+    followed = followed_files(store)
     with _refactor_lock:
         _cleanup_expired()
         _pending_refactors[refactor_id] = preview
+        if followed:
+            _followed_edit_files[refactor_id] = frozenset(
+                normalize_file_path(edit["file"]) for edit in edits
+                if normalize_file_path(edit["file"]) in followed
+            )
 
     logger.info(
         "rename_preview: created refactor %s (%s -> %s, %d edits)",
@@ -1756,9 +1775,15 @@ def _rename_edits(
     js_module_symbol = False
     # A bare-name CALLS edge is a guess about which same-named symbol a
     # call means, but it is the only evidence for a call no import spells.
-    bare_edges = store.search_edges_by_target_name(
-        name, kind="CALLS", language=language or None,
-    )
+    # A settled edge named a class, ``h.build()`` on a ``Helper``, and a
+    # same-named method of another class is not what it called.
+    bare_edges = [
+        edge for edge in store.search_edges_by_target_name(
+            name, kind="CALLS", language=language or None,
+        )
+        if CLAIMED_ENDPOINT_KEY not in edge.extra
+        or store.receiver_evidence_admits(edge.extra, node)
+    ]
     bare_files = {edge.file_path for edge in bare_edges}
     python_sites = (
         _python_rename_sites(store, node, sources, bare_files)
@@ -1865,7 +1890,7 @@ def _is_entry_point(node: Any) -> bool:
     framework decorators -- the indicators that a function is *intentionally*
     an entry point rather than simply unreferenced dead code.
     """
-    if _has_framework_decorator(node):
+    if _has_framework_decorator(node) or _has_override_decorator(node):
         return True
     if _matches_entry_name(node):
         return True
@@ -1899,6 +1924,32 @@ def _collect_type_referenced_names(store: GraphStore) -> set[str]:
             if text:
                 names.update(_TYPE_IDENT_RE.findall(text))
     return names
+
+
+_ASCII_FOLD = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def _ascii_fold(text: str) -> str:
+    """Fold case the way SQLite ``LIKE`` does: ASCII letters only.
+
+    ``str.lower`` also folds other scripts, which merges distinct names and,
+    because a final sigma lowers differently from an inner one, can make
+    ``"\u039f\u03a3"`` miss itself inside ``"\u039f\u03a3.run"``.
+    """
+    return text.lower() if text.isascii() else text.translate(_ASCII_FOLD)
+
+
+def _csharp_member_scopes(conn: Any) -> dict[str, set[str]]:
+    """Map each C# type's leaf name to the parent names its members use."""
+    scopes: dict[str, set[str]] = {}
+    for (parent,) in conn.execute(
+        "SELECT DISTINCT parent_name FROM nodes WHERE language = 'csharp' "
+        "AND parent_name IS NOT NULL AND kind IN ('Function', 'Test')"
+    ):
+        scopes.setdefault(parent.rpartition(".")[2], set()).add(parent)
+    return scopes
 
 
 def find_dead_code(
@@ -1969,22 +2020,85 @@ def find_dead_code(
     # Build set of class names referenced in function type annotations.
     type_ref_names = _collect_type_referenced_names(store)
 
-    # Build class hierarchy: class_qualified_name -> [bare_base_names]
+    # Read edge evidence once. In particular, suffix/member LIKE lookups inside
+    # the candidate loop scan the entire edges table once per symbol (#982).
+    # Store only the fields needed for evidence, deduplicated across call sites.
+    incoming_kinds: dict[str, set[str]] = {}
+    bare_files_by_language: dict[tuple[str, str, str | None], set[str]] = {}
+    bare_files_all: dict[tuple[str, str], set[str]] = {}
+    suffix_call_files: dict[str, set[str]] = {}
+    tested_files: dict[str, set[str]] = {}
+    member_call_names: set[str] = set()
+    class_names = {_ascii_fold(node.name) for node in candidates if node.kind == "Class"}
+    max_class_name_length = max(map(len, class_names), default=0)
     class_bases: dict[str, list[str]] = {}
+    base_targets: dict[str, set[str]] = {}
+    importer_files: dict[str, set[str]] = {}
+    csharp_member_scopes: dict[str, set[str]] | None = None
     conn = store._conn
     for row in conn.execute(
-        "SELECT source_qualified, target_qualified FROM edges WHERE kind = 'INHERITS'"
-    ).fetchall():
-        base = row[1].rsplit("::", 1)[-1] if "::" in row[1] else row[1]
-        class_bases.setdefault(row[0], []).append(base)
+        "SELECT e.kind, e.source_qualified, e.target_qualified, e.file_path, n.language, "
+        f"CASE WHEN instr(e.extra, '\"{CLAIMED_ENDPOINT_KEY}\"') AND json_valid(e.extra) "
+        f"THEN json_extract(e.extra, '$.{CLAIMED_ENDPOINT_KEY}') "
+        f"WHEN instr(e.extra, '\"{INHERITED_ENDPOINT_KEY}\"') AND json_valid(e.extra) "
+        f"THEN json_extract(e.extra, '$.{INHERITED_ENDPOINT_KEY}') END, "
+        f"CASE WHEN instr(e.extra, '\"{INHERITED_THROUGH_KEY}\"') AND json_valid(e.extra) "
+        f"THEN json_extract(e.extra, '$.{INHERITED_THROUGH_KEY}') END "
+        "FROM edges e LEFT JOIN nodes n ON n.qualified_name = e.source_qualified "
+        "WHERE e.kind IN ('CALLS', 'TESTED_BY', 'IMPORTS_FROM', 'INHERITS', 'REFERENCES')"
+    ):
+        edge_kind, source, target, file_path, language, claimed, through = row
+        # The class hierarchy and import graph describe the code, not its use,
+        # so a story still counts here. Only liveness evidence skips stories.
+        if edge_kind == "INHERITS":
+            class_bases.setdefault(source, []).append(target.rsplit("::", 1)[-1])
+            base_targets.setdefault(source, set()).add(target)
+        elif edge_kind == "IMPORTS_FROM":
+            importer_files.setdefault(file_path, set()).add(target)
+        if _STORYBOOK_FILE_RE.search(file_path):
+            continue
+        incoming_kinds.setdefault(target, set()).add(edge_kind)
+        if edge_kind in ("CALLS", "INHERITS"):
+            bare_files_by_language.setdefault((edge_kind, target, language), set()).add(file_path)
+            bare_files_all.setdefault((edge_kind, target), set()).add(file_path)
+        if edge_kind == "CALLS":
+            # ``Util.make()`` with ``make`` inherited names no node, so its
+            # target went back to ``make``, or on to ``Base.make`` when the
+            # graph knows the ancestor. It still shows ``Util`` is in use.
+            named = {target}
+            if isinstance(claimed, str):
+                named.add(claimed)
+            if isinstance(through, str):
+                named.add(f"{through}.{target.rsplit('.', 1)[-1]}")
+            for written_target in named:
+                if "::" in written_target:
+                    suffix_call_files.setdefault(
+                        _ascii_fold(written_target.rsplit("::", 1)[-1]), set(),
+                    ).add(file_path)
+                # Preserve the old substring heuristic: Widget. also matches
+                # MyWidget. (conservative for dead-code deletion suggestions).
+                # Every dot can terminate a class name, including a dotted
+                # Elixir module. Bound suffixes by candidate name length, so
+                # long file paths do not create a quadratic set of irrelevant
+                # substrings.
+                lowered_target = _ascii_fold(written_target)
+                for end, character in enumerate(lowered_target):
+                    if character == ".":
+                        member_call_names.update(
+                            lowered_target[start:end]
+                            for start in range(max(0, end - max_class_name_length), end)
+                            if lowered_target[start:end] in class_names
+                        )
+        elif edge_kind == "TESTED_BY":
+            tested_files.setdefault(source, set()).add(file_path)
 
-    # Build import graph: file_path -> set of file_paths it imports from.
-    # Used to filter bare-name caller matches to plausible callers.
-    importer_files: dict[str, set[str]] = {}
-    for row in conn.execute(
-        "SELECT file_path, target_qualified FROM edges WHERE kind = 'IMPORTS_FROM'"
-    ).fetchall():
-        importer_files.setdefault(row[0], set()).add(row[1])
+    def _bare_files(name: str, language: str, edge_kind: str = "CALLS") -> set[str]:
+        languages = _compatible_edge_languages(language) if language else None
+        if languages is None:
+            return bare_files_all.get((edge_kind, name), set())
+        return set().union(*(
+            bare_files_by_language.get((edge_kind, name, lang), set()) for lang in languages
+        ))
 
     # Build set of globally unique names (only one non-test node with that name).
     # For unique names, any bare-name CALLS edge is reliable — no ambiguity.
@@ -2068,6 +2182,20 @@ def find_dead_code(
         if node.extra.get("verilog_kind"):
             continue
 
+        # The XSLT processor picks a template with a match from the input
+        # document, named or not, so nothing calling it says nothing about
+        # whether it runs.
+        if node.extra.get("xslt_kind") in ("match_template", "named_template") and (
+            node.extra.get("match")
+        ):
+            continue
+
+        # A TS abstract signature is a contract with no body, reached through
+        # its implementations, so it cannot be dead on its own (like Python's
+        # @abstractmethod, handled below).
+        if node.extra.get("abstract"):
+            continue
+
         # Skip entry points (by name pattern or decorator, not just "uncalled").
         if _is_entry_point(node):
             continue
@@ -2090,10 +2218,9 @@ def find_dead_code(
             node.qualified_name.rsplit(".", 1)[0] if node.parent_name else None
         )
         if _check_qn:
-            outgoing = store.get_edges_by_source(_check_qn)
             base_names = {
-                e.target_qualified.rsplit("::", 1)[-1]
-                for e in outgoing if e.kind == "INHERITS"
+                target.rsplit("::", 1)[-1]
+                for target in base_targets.get(_check_qn, ())
             }
             if base_names & _FRAMEWORK_BASE_CLASSES:
                 _is_framework_class = True
@@ -2139,10 +2266,7 @@ def find_dead_code(
         # they are called polymorphically via the base class reference.
         if node.kind == "Function" and node.parent_name:
             parent_qn = node.qualified_name.rsplit(".", 1)[0]
-            parent_edges = store.get_edges_by_source(parent_qn)
-            base_class_names = [
-                e.target_qualified for e in parent_edges if e.kind == "INHERITS"
-            ]
+            base_class_names = list(base_targets.get(parent_qn, ()))
             for base_name in base_class_names:
                 # Try fully-qualified base first, then bare name match
                 base_method_qn = f"{base_name}.{node.name}"
@@ -2164,83 +2288,47 @@ def find_dead_code(
             if base_name is not None:
                 continue
 
-        incoming = [
-            e for e in store.get_edges_by_target(node.qualified_name)
-            if not _STORYBOOK_FILE_RE.search(e.file_path)
-        ]
+        incoming = set(incoming_kinds.get(node.qualified_name, ()))
         # Also check class-qualified edges (e.g. "ClassName::method") which
         # lack the file-path prefix used in node.qualified_name.
-        if not any(e.kind == "CALLS" for e in incoming) and node.parent_name:
+        if "CALLS" not in incoming and node.parent_name:
             class_qn = f"{node.parent_name}::{node.name}"
-            incoming += [
-                e for e in store.get_edges_by_target(class_qn)
-                if not _STORYBOOK_FILE_RE.search(e.file_path)
-            ]
+            incoming.update(incoming_kinds.get(class_qn, ()))
         # Also check bare-name and partially-qualified edges.
         # CALLS targets may be bare ("funcName"), class-qualified
         # ("Class::method"), or workspace-qualified ("pkg/dir::funcName").
-        if not any(e.kind == "CALLS" for e in incoming):
-            bare = store.search_edges_by_target_name(
-                node.name,
-                kind="CALLS",
-                language=node.language or None,
-            )
-            # Also search for partially-qualified targets ending with ::name
-            suffix_rows = conn.execute(
-                "SELECT * FROM edges WHERE kind = 'CALLS'"
-                " AND target_qualified LIKE ?",
-                (f"%::{node.name}",),
-            ).fetchall()
-            suffix_edges = [store._row_to_edge(r) for r in suffix_rows]
-            all_bare = bare + suffix_edges
-            all_bare = [
-                e for e in all_bare
-                if _is_plausible_caller(e.file_path, node.file_path, node.name)
-            ]
-            incoming = incoming + all_bare
+        if "CALLS" not in incoming:
+            bare_files = _bare_files(node.name, node.language or "")
+            suffix_files = suffix_call_files.get(_ascii_fold(node.name), set())
+            if any(_is_plausible_caller(file, node.file_path, node.name)
+                   for file in bare_files | suffix_files):
+                incoming.add("CALLS")
         # TESTED_BY edges are stored as source=production, target=test by the
         # parser, so a tested production node is the *source* of its TESTED_BY
         # edge -- look outgoing, not incoming. See: #515
-        outgoing_tb = [
-            e for e in store.get_edges_by_source(node.qualified_name)
-            if e.kind == "TESTED_BY"
-        ]
+        outgoing_tb = bool(tested_files.get(node.qualified_name))
         if not outgoing_tb and node.parent_name:
             # Class-qualified source (e.g. "ClassName::method") which lacks the
             # file-path prefix used in node.qualified_name.
             class_qn = f"{node.parent_name}::{node.name}"
-            outgoing_tb += [
-                e for e in store.get_edges_by_source(class_qn)
-                if e.kind == "TESTED_BY"
-            ]
+            outgoing_tb = bool(tested_files.get(class_qn))
         if not outgoing_tb:
             # Bare-name source fallback: unresolved TESTED_BY edges may store the
             # production function by its plain name (e.g. "authenticate").
-            bare_rows = conn.execute(
-                "SELECT * FROM edges WHERE kind = 'TESTED_BY' AND source_qualified = ?",
-                (node.name,),
-            ).fetchall()
-            outgoing_tb += [
-                e for e in (store._row_to_edge(r) for r in bare_rows)
-                if _is_plausible_caller(e.file_path, node.file_path, node.name)
-            ]
-        # Check INHERITS -- classes with subclasses are not dead.
-        if node.kind == "Class" and not any(e.kind == "INHERITS" for e in incoming):
-            bare_inh = store.search_edges_by_target_name(
-                node.name,
-                kind="INHERITS",
-                language=node.language or None,
+            outgoing_tb = any(
+                _is_plausible_caller(file, node.file_path, node.name)
+                for file in tested_files.get(node.name, ())
             )
-            incoming = incoming + bare_inh
-        # Stories demonstrate a component but do not prove application use.
-        # Check paths as well as flags so pre-existing graphs behave correctly.
-        incoming = [e for e in incoming if not _STORYBOOK_FILE_RE.search(e.file_path)]
-        outgoing_tb = [e for e in outgoing_tb if not _STORYBOOK_FILE_RE.search(e.file_path)]
-        has_callers = any(e.kind == "CALLS" for e in incoming)
+        # Check INHERITS -- classes with subclasses are not dead.
+        if node.kind == "Class" and "INHERITS" not in incoming:
+            if ("INHERITS" in incoming_kinds.get(node.name, ())
+                    and _bare_files(node.name, node.language or "", "INHERITS")):
+                incoming.add("INHERITS")
+        has_callers = "CALLS" in incoming
         has_test_refs = bool(outgoing_tb)
-        has_importers = any(e.kind == "IMPORTS_FROM" for e in incoming)
-        has_references = any(e.kind == "REFERENCES" for e in incoming)
-        has_subclasses = any(e.kind == "INHERITS" for e in incoming)
+        has_importers = "IMPORTS_FROM" in incoming
+        has_references = "REFERENCES" in incoming
+        has_subclasses = "INHERITS" in incoming
 
         # For classes with no direct references, check if any member has callers.
         no_refs = not (
@@ -2248,15 +2336,7 @@ def find_dead_code(
             or has_references or has_subclasses
         )
         if node.kind == "Class" and no_refs:
-            member_prefix = node.qualified_name + "."
-            # Also check bare class-name pattern (unresolved CALLS targets)
-            bare_prefix = node.name + "."
-            member_calls = conn.execute(
-                "SELECT file_path FROM edges WHERE kind = 'CALLS'"
-                " AND (target_qualified LIKE ? OR target_qualified LIKE ?)",
-                (f"%{member_prefix}%", f"%{bare_prefix}%"),
-            )
-            if any(not _STORYBOOK_FILE_RE.search(row[0]) for row in member_calls):
+            if _ascii_fold(node.name) in member_call_names:
                 has_callers = True
 
         if not (
@@ -2271,19 +2351,30 @@ def find_dead_code(
                 if node.qualified_name.endswith(method_suffix):
                     class_qn = node.qualified_name[: -len(method_suffix)]
                     for base_name in class_bases.get(class_qn, []):
-                        rows = conn.execute(
-                            "SELECT n.qualified_name FROM nodes n "
-                            "WHERE n.parent_name = ? AND n.name = ? "
-                            "AND n.kind IN ('Function', 'Test')",
-                            (base_name, node.name),
-                        ).fetchall()
+                        base_parents = [base_name]
+                        if node.language == "csharp":
+                            # C# parent names carry the namespace while the
+                            # INHERITS target keeps its source spelling, so
+                            # ``ISink`` names ``Lib.ISink`` (#964).
+                            if csharp_member_scopes is None:
+                                csharp_member_scopes = _csharp_member_scopes(conn)
+                            base_parents += [
+                                scope for scope in csharp_member_scopes.get(
+                                    base_name.rpartition(".")[2], (),
+                                )
+                                if scope != base_name and scope.endswith("." + base_name)
+                            ]
+                        rows = [
+                            row for parent in base_parents
+                            for row in conn.execute(
+                                "SELECT n.qualified_name FROM nodes n "
+                                "WHERE n.parent_name = ? AND n.name = ? "
+                                "AND n.kind IN ('Function', 'Test')",
+                                (parent, node.name),
+                            ).fetchall()
+                        ]
                         for (base_method_qn,) in rows:
-                            if conn.execute(
-                                "SELECT 1 FROM edges "
-                                "WHERE target_qualified = ? AND kind = 'CALLS' "
-                                "LIMIT 1",
-                                (base_method_qn,),
-                            ).fetchone():
+                            if "CALLS" in incoming_kinds.get(base_method_qn, ()):
                                 has_callers = True
                                 break
                         if has_callers:
@@ -2527,11 +2618,19 @@ def apply_refactor(
         return {"status": "ok", "applied": 0, "files_modified": [], "edits_applied": 0}
 
     # --- Path traversal validation ---
+    from .incremental import path_within_repo
+
+    with _refactor_lock:
+        followed = _followed_edit_files.get(refactor_id, frozenset())
     for edit in edits:
         edit_path = Path(edit["file"]).resolve()
         try:
             edit_path.relative_to(repo_root)
         except ValueError:
+            # A file behind a followed symlinked folder is edited through its
+            # in-repo path; nothing else outside the repository is.
+            if followed and path_within_repo(repo_root, edit["file"], followed):
+                continue
             logger.error(
                 "apply_refactor: path traversal blocked for %s (repo_root=%s)",
                 edit_path, repo_root,

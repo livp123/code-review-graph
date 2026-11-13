@@ -70,16 +70,18 @@ The sample list and raw counts behind this table are not stored in the repositor
 - Network access to clone the six upstream repositories
 - For embeddings, `torch` and `sentence-transformers`, installed by the `embeddings` extra
 
-## Step 1: install with the eval and embeddings extras
+## Step 1: install with the eval, embeddings and communities extras
 
 ```bash
 git clone https://github.com/tirth8205/code-review-graph
 cd code-review-graph
-uv sync --extra eval --extra embeddings     # or: pip install -e ".[eval,embeddings]"
+uv sync --extra eval --extra embeddings --extra communities     # or: pip install -e ".[eval,embeddings,communities]"
 ```
 
-`eval` is `pyyaml` and `matplotlib` (matplotlib is only used by `--report`); `embeddings` is
-`sentence-transformers` and `numpy`.
+`eval` is `pyyaml` and `matplotlib` (the eval itself does not use matplotlib; only
+`visualize --format svg` does); `embeddings` is `sentence-transformers` and `numpy`;
+`communities` is `igraph`, which Leiden needs. Without it the build groups communities by
+file, so the community numbers will not match.
 
 ## Step 2: run the eval
 
@@ -92,10 +94,9 @@ uv run code-review-graph eval --embed \
   --benchmark token_efficiency,impact_accuracy,agent_baseline,multi_hop_retrieval
 ```
 
-`--embed` is required for `agent_baseline` and `multi_hop_retrieval`; without it their
-natural-language questions hit FTS5 only and return nothing. `code-review-graph eval --help`
-lists the remaining benchmarks (`flow_completeness`, `search_quality`, `build_performance`,
-`incremental_fidelity`) and flags.
+`--embed` is required for `agent_baseline`, `multi_hop_retrieval` and `search_quality`;
+without it their natural-language questions hit FTS5 only and return nothing. `code-review-graph eval --help` lists the remaining benchmarks (`flow_completeness`,
+`search_quality`, `build_performance`, `incremental_fidelity`) and flags.
 
 A thrown tool call is not a measurement. The row stays in the CSV with `status=error` and is
 excluded from every aggregate. Regression tests for this are in `tests/test_eval.py`.
@@ -161,6 +162,10 @@ Captured 2026-08-02 on macOS arm64 (Apple M4 Pro, 14 cores, 24 GB), Python 3.13.
 code-review-graph 2.3.7, sentence-transformers 5.6.1, `all-MiniLM-L6-v2`,
 `CRG_LEIDEN_SEED=42`, from clean clones at the pinned SHAs.
 
+These numbers predate 2.4.0, which also indexes HTML, JSON, YAML and Liquid files and ranks
+test code below production code in search, so a 2.4.0 run gives different node, edge,
+embedding and token counts until the capture is redone.
+
 ### Standalone token benchmark (`code_review_graph/token_benchmark.py`)
 
 Each row averages the 5 sample questions (`how does authentication work`, `what is the main
@@ -220,10 +225,13 @@ The predictor over-predicts on some commits. The worst case is flask `fbb6f0bc`:
 flagged for a 10-file change, precision 0.303. That trade-off is deliberate: a missed
 dependency costs more than an extra reviewed file.
 
-The co-change rows are not usable yet: all 11 graded commits came back with
-`predicted_files = 0`, so their F1 of 0.000 measures a harness fault, not the predictor. No
-co-change number is quoted until that is fixed. The two single-file commits (express) are
-recorded with `status=skipped` because there is nothing independent to grade against.
+The co-change rows in this capture are not usable: all 11 graded commits came back with
+`predicted_files = 0`, so their F1 of 0.000 measures a fault in the benchmark, not the
+predictor. `git diff` gives repo-relative paths and the graph stores absolute ones, so the
+seed never matched a node. PR #823 fixed that, and the graph-derived ground truth now counts
+real neighbour files too, so both tables will change when the benchmark is run again. No
+co-change number is quoted until then. The two single-file commits (express) are recorded
+with `status=skipped` because there is nothing independent to grade against.
 
 ### Multi-hop retrieval (`code_review_graph/eval/benchmarks/multi_hop_retrieval.py`)
 
@@ -355,8 +363,48 @@ This benchmark simulates an agent without the graph:
 
 Output: `evaluate/results/<repo>_agent_baseline_<date>.csv` with a `baseline_to_graph_ratio`
 per question. Rows where either side is zero get `status=no_graph_results` or
-`status=no_baseline_match` and are excluded from `agent_baseline.aggregate()`. No canonical
-capture exists yet; numbers will be added above once measured.
+`status=no_baseline_match` and are excluded from `agent_baseline.aggregate()`.
+
+### Canonical capture, 2026-09-22
+
+18 questions, 3 per repo, from the `agent_questions:` lists. Local `all-MiniLM-L6-v2`
+embeddings, clean clones at the pinned SHAs, every row `status=ok`.
+
+| Repo | Questions | avg grep top-3 tokens | avg graph tokens | median ratio |
+|------|----------:|----------------------:|-----------------:|-------------:|
+| fastapi | 3 | 158,560 | 3,439 | **52.1x** |
+| flask | 3 | 27,611 | 2,432 | **11.5x** |
+| gin | 3 | 25,257 | 3,110 | **6.6x** |
+| httpx | 3 | 26,174 | 4,021 | **6.5x** |
+| code-review-graph | 3 | 26,134 | 3,773 | **6.4x** |
+| express | 3 | 17,086 | 3,726 | **4.5x** |
+
+Across all 18 questions: **median 6.65x, mean 14.81x, range 4.2x to 72.6x**.
+
+Run it with:
+
+```bash
+code-review-graph eval --benchmark agent_baseline --embed
+```
+
+This capture predates test-file ranking in `hybrid_search` and `grep_rank`, so a run today
+gives different numbers until the capture is redone. At the code-review-graph pin the grep
+baseline alone moves from 41,674 / 15,028 / 21,701 tokens to 41,586 / 27,764 / 29,207.
+
+Two things this number is not:
+
+- **It is not the whole-corpus ratio.** The standalone benchmark's ~63x compares a graph
+  query against reading every source file, which no agent does. Against a grep-and-read
+  agent the honest figure is the 6.65x above. Quote whichever you mean, and say which.
+- **It is not an end-to-end agent saving.** Both sides here are measured as *retrieval*
+  cost: the tokens needed to locate the answer. A real coding agent may still open the
+  files the graph named, in which case the graph cost is additive rather than a
+  substitute. `semantic_search_nodes_tool(include_source=True)` exists so the agent can
+  answer from the response instead; measuring that path end-to-end is open work.
+
+The ratio tracks repo size, because the graph answer stays flat (2,432 to 4,021 tokens
+here) while the grep baseline grows with the corpus. On a small repo the graph saves
+little; on fastapi it saves a lot.
 
 ## Incremental fidelity (`code_review_graph/eval/benchmarks/incremental_fidelity.py`)
 
@@ -382,7 +430,9 @@ content table behind it.
 ### Results on this repository
 
 323 files, 6,509 nodes, 57,042 edges, 186 flows. Differing rows per table, incremental
-update against clean rebuild:
+update against clean rebuild. Measured at schema v14: `community_summaries`,
+`flow_snapshots` and `risk_index` were removed in v15, as nothing read them, and the
+benchmark no longer compares them.
 
 | Edit | Status | Total | nodes | node_community | edges | communities | flows | flow_memberships | nodes_fts | community_summaries | flow_snapshots | risk_index | metadata | Seconds |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -397,7 +447,9 @@ update against clean rebuild:
 Benchmark wall time 79.1 s (8 clean builds plus 8 incremental updates).
 
 `nodes` and `nodes_fts` match everywhere: node rows and the search index are faithful. Every
-other divergence traces to one of three defects, none of which is fixed here.
+other divergence traces to one of three defects. The table was measured before #673, which
+fixes defects 1 and 2 below (flows and community assignment now follow re-parsed nodes), so
+expect smaller numbers until it is captured again.
 
 **1. `flow_memberships` is orphaned by every re-parse.** `flow_memberships.node_id` is a
 bare integer with no foreign key and no cascade, and `GraphStore._replace_file_data` deletes
@@ -411,10 +463,7 @@ the repair path as well, so a full rebuild is the only way back.
 edit leaves 718 nodes with `community_id IS NULL` against the rebuild's 306.
 `incremental_detect_communities` and `incremental_trace_flows` both match `nodes.file_path`
 (absolute) against `incremental_update`'s `changed_files` (repo-relative), so both always
-count zero affected rows and skip. `community_summaries` inherits the error: after the same
-edit its `key_symbols` for `code-review-graph-name` read
-`["main", "GraphStore", "close", "upsert_node", "commit"]` against the rebuild's
-`["CodeParser", "main", "GraphStore", "close", "NodeInfo"]`.
+count zero affected rows and skip.
 
 **3. Deleting a file silently shortens other files' caller lists.** Deleting
 `code_review_graph/graph.py` leaves the incremental graph with 52,913 edges against the
@@ -423,8 +472,6 @@ has no outgoing `CALLS` edge at all at lines 73 and 100 in the incremental graph
 rebuild has two (`_build_networkx_graph` and `_sanitize_name`). Those edges had been
 resolved into `graph.py`, were removed with it, and `analysis.py` was never re-parsed to
 restore them as bare calls. Two edges still target `graph.py::` names that have no node.
-`risk_index` inherits it: `parser.py::EdgeInfo` reports `caller_count` 268 against the
-rebuild's 267.
 
 The six `edges` rows that differ on every edit are a separate, smaller issue: the
 `ambiguous_targets` list inside an edge's `extra` JSON is ordered by node id, so re-parsing a
@@ -432,8 +479,9 @@ file reorders it. Same set, different order, so the graph is not byte-reproducib
 
 Every edit kind is listed in `incremental_fidelity.KNOWN_FAILURES`, which keeps the run from
 reporting them as unexpected. `tests/test_incremental_fidelity.py` guards against a kind that
-currently passes starting to diverge, and carries two `xfail` tests that document defects 1
-and 2 at the level of the defect.
+currently passes starting to diverge, and pins defects 1 and 2 at the level of the defect.
+Defect 2 has plain tests, one of them for a file that an update adds (#1122). Defect 1's test
+is still marked `xfail` but now passes.
 
 ## Weekly CI run (report-only)
 
@@ -448,13 +496,13 @@ job-summary table. Regressions do not fail the default branch.
 |---|---|---|---|
 | `code_review_graph/eval/benchmarks/token_efficiency.py` | changed-file content of one commit | full `get_review_context()` JSON | Is the graph cheaper than reading the diffed files? |
 | `code_review_graph/eval/benchmarks/agent_baseline.py` | grep, top 3 files for the question's identifiers | 5 search hits + 5 neighbour edges per hit | Is the graph cheaper than a grep-and-read agent? |
-| `code_review_graph/eval/token_benchmark.py` | none; absolute cost | sum of the tool responses in simulated review, architecture and debug workflows | What does a complete agent workflow cost? |
+| `code_review_graph/eval/token_benchmark.py` | none; absolute cost | sum of the tool responses in simulated review, architecture, debug, onboarding and pre-merge workflows | What does a complete agent workflow cost? |
 | `code_review_graph/token_benchmark.py` (standalone) | all source files in the repo | 5 search hits + 5 neighbour edges per hit | Is the graph cheaper than reading the whole repo? |
 | `code_review_graph/eval/benchmarks/incremental_fidelity.py` | a clean rebuild of the same tree | the same graph after `incremental_update` | Does an incremental update equal a rebuild? |
 
 `token_efficiency` can be below 1.0x for small commits. The standalone numbers are always
 large because the baseline is the whole repo, which is why the README leads with the median
-(about 65x), treats 376x as the maximum, and points to `agent_baseline` as the realistic
+(about 63x), treats 358x as the maximum, and points to `agent_baseline` as the realistic
 middle ground. Quote the one that matches the scenario.
 
 ## Generating diagrams
@@ -464,9 +512,11 @@ The 9 PNGs in `diagrams/` are produced from `diagrams/generate_diagrams.py`. The
 tracked. After a benchmark refresh:
 
 ```bash
-uv run python diagrams/generate_diagrams.py
-# Open each .excalidraw at https://excalidraw.com to render and export
+uv run python diagrams/generate_diagrams.py         # write all 9 .excalidraw files
+uv run python diagrams/generate_diagrams.py 1 5 6   # write only diagrams 1, 5 and 6
 ```
+
+Then open the files in an Excalidraw editor and export each one as a PNG.
 
 ## Troubleshooting
 
@@ -502,29 +552,29 @@ python -m tests.real_repo_corpus --record   # re-record after an intentional cha
 ```
 
 The normal suite skips it: `tests/conftest.py` skips every `corpus`-marked item unless the
-run's `-m` expression names the marker, so neither `pytest tests/` nor CI's `-m "not browser"`
-job pays for it. Clones are shallow single-commit fetches (~115 MB total). A cold run takes
-about 1 minute on a warm network and roughly 40 seconds once the clones are cached; budget a
-few minutes on CI hardware.
+run's `-m` expression names the marker, so neither `pytest tests/` nor CI's
+`-m "not browser and not upgrade"` job pays for it. Clones are shallow single-commit fetches
+(~115 MB total). A cold run takes about 1 minute on a warm network and roughly 40 seconds
+once the clones are cached; budget a few minutes on CI hardware.
 
 `fastapi` and `gin` reuse the pins in `code_review_graph/eval/configs/`, so the project keeps
 one answer to "which commit of fastapi do we measure". `tests/test_real_repo_corpus_guard.py`
 fails if those two ever drift apart.
 
-### Initial baseline
+### Recorded baseline (2.4.0)
 
 Measured on macOS 15 (Apple silicon), CPython 3.13.
 
 | Repo | Language | Commit | Files | Nodes | Edges | Resolved edges | Resolved imports | Parse errors | Files with no node | Dangling CONTAINS | Build |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| fastapi | python | `22381558` | 1179 | 6287 | 32613 | 51.1% | 47.6% | 0 | 51 | 0 | 5.4s |
-| gin | go | `5c00df8a` | 109 | 1591 | 17266 | 51.4% | 0.0% | 0 | 11 | 1 | 2.5s |
-| zod | typescript | `59bbc03e` | 534 | 7082 | 98833 | 52.9% | 43.4% | 0 | 11 | 0 | 13.9s |
-| gson | java | `854c8255` | 272 | 4125 | 47564 | 52.5% | 14.6% | 0 | 8 | 693 | 10.7s |
-| newtonsoft-json | csharp | `09bb545d` | 952 | 9094 | 76052 | 60.1% | 0.0% | 0 | 2 | 486 | 20.6s |
-| ripgrep | rust | `3fce3b5b` | 125 | 3518 | 29256 | 46.1% | 22.4% | 0 | 5 | 17 | 3.5s |
-| sinatra | ruby | `cb22afd7` | 157 | 1224 | 14647 | 19.7% | 0.0% | 0 | 10 | 615 | 2.1s |
-| guzzle | php | `93939470` | 141 | 3221 | 43443 | 57.6% | 45.1% | 0 | 4 | 0 | 6.5s |
+| fastapi | python | `22381558` | 1182 | 10804 | 36969 | 56.8% | 46.9% | 0 | 0 | 0 | 5.4s |
+| gin | go | `5c00df8a` | 109 | 1870 | 17530 | 52.2% | 0.0% | 0 | 0 | 1 | 2.5s |
+| zod | typescript | `59bbc03e` | 577 | 8629 | 99923 | 53.7% | 65.5% | 0 | 0 | 0 | 13.9s |
+| gson | java | `854c8255` | 273 | 4736 | 47834 | 62.2% | 34.1% | 0 | 0 | 0 | 10.7s |
+| newtonsoft-json | csharp | `09bb545d` | 977 | 10491 | 76920 | 52.9% | 0.0% | 0 | 0 | 0 | 20.6s |
+| ripgrep | rust | `3fce3b5b` | 125 | 3755 | 29431 | 47.1% | 22.8% | 0 | 0 | 17 | 3.5s |
+| sinatra | ruby | `cb22afd7` | 159 | 3268 | 24701 | 55.8% | 31.4% | 0 | 0 | 0 | 2.1s |
+| guzzle | php | `93939470` | 145 | 3451 | 43658 | 57.7% | 45.1% | 0 | 0 | 0 | 6.5s |
 
 Counts are deterministic: two recording runs on the same machine produced identical numbers
 for every column except `Build`.
@@ -553,8 +603,8 @@ Each failure names the property, the recorded value, the measured value, the del
 band. Dropping `".go": "go"` from the parser's extension map produces:
 
 ```text
-gin (go) @ 5c00df8afadd: 6 of 12 properties moved out of band
+gin (go) @ 5c00df8afadd: 5 of 12 properties moved out of band
   - files_parsed fell below its band: baseline=109 measured=11 delta=-98 (-89.9%), allowed [106.8, 136.2] (x0.98..x1.25)
-  - total_nodes fell below its band: baseline=1591 measured=0 delta=-1591 (-100.0%), allowed [1463.7, 2227.4] (x0.92..x1.4)
-  - primary_language_present dropped: baseline=1 measured=0 delta=-1. gin is a go project but the graph holds languages []
+  - total_nodes fell below its band: baseline=1870 measured=275 delta=-1595 (-85.3%), allowed [1720.4, 2618.0] (x0.92..x1.4)
+  - primary_language_present dropped: baseline=1 measured=0 delta=-1. gin is a go project but the graph holds languages ['yaml']
 ```
